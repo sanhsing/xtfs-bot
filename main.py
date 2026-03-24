@@ -1,5 +1,5 @@
 """
-XTFS Bot v5.5 — 智能路由版
+XTFS Bot v5.6 — 智能路由版
 整合 Z_xtfs_router_unified_v1.6 三層路由決策
 Railway 長輪詢部署
 
@@ -302,6 +302,705 @@ def call_tower_structured(
         )
     return fn(system, history, msg, task_id, start_time, keys)
 
+
+# ============================================================
+# 結構化輸出模組 v1_final（X塔5輪審查通過）
+# ============================================================
+ALLOWED_STRUCTURED_FIELDS_BY_WORKFLOW = {
+    workflow: set(schema.keys()) for workflow, schema in WORKFLOW_SCHEMAS.items()
+}
+
+@dataclass
+class TowerOutput:
+    task_id: str
+    tower: str
+    status: str
+    content: str
+    structured: dict = field(default_factory=dict)
+    confidence: float = 0.8
+    tokens: int = 0
+    elapsed: float = 0.0
+    next_input: str = ""
+    timestamp: str = ""
+    error_detail: str = ""
+    tool_audit: List[dict] = field(default_factory=list)
+
+    def __post_init__(self):
+        if not self.next_input:
+            self.next_input = self.content
+        if not self.timestamp:
+            self.timestamp = datetime.now(TZ).isoformat()
+
+# L1: WorkflowResult dataclass
+@dataclass
+class WorkflowResult:
+    task_id: str
+    task: str
+    workflow: str
+    towers: List[str]
+    summary: str
+    structured: dict
+    total_tokens: int
+    total_elapsed: float
+    status: str
+    timestamp: str
+
+# Tool definitions
+@dataclass
+class ToolDef:
+    name: str
+    description: str
+    parameters: Dict[str, Any]
+    handler: Callable
+    allowed_towers: List[str]
+
+@dataclass
+class ToolCall:
+    name: str
+    arguments: Dict[str, Any]
+    call_id: str
+
+@dataclass
+class ToolResult:
+    call_id: str
+    result: Any
+    error: Optional[str] = None
+    elapsed: float = 0.0
+
+class ToolRegistry:
+    def __init__(self):
+        self.tools: Dict[str, ToolDef] = {}
+        self.call_history: List[ToolResult] = []
+        self.call_count_by_tower: Dict[str, int] = {}
+        self.total_calls = 0
+
+    def register(self, tool: ToolDef):
+        self.tools[tool.name] = tool
+
+    def can_call(self, tool_name: str, tower: str, workflow: str) -> bool:
+        tool = self.tools.get(tool_name)
+        if not tool:
+            return False
+        if tower not in tool.allowed_towers:
+            return False
+        if self.call_count_by_tower.get(tower, 0) >= MAX_TOOL_CALLS_PER_TOWER:
+            return False
+        if self.total_calls >= MAX_TOOL_CALLS_PER_WORKFLOW:
+            return False
+        return True
+
+    def execute(self, call: ToolCall, tower: str, workflow: str) -> ToolResult:
+        start = time.time()
+        if not self.can_call(call.name, tower, workflow):
+            return ToolResult(
+                call_id=call.call_id,
+                result=None,
+                error=f"Tool {call.name} not allowed or limits exceeded",
+                elapsed=time.time() - start
+            )
+        
+        tool = self.tools[call.name]
+        try:
+            result = tool.handler(**call.arguments)
+            self.call_history.append(ToolResult(call.call_id, result, None, time.time() - start))
+            self.call_count_by_tower[tower] = self.call_count_by_tower.get(tower, 0) + 1
+            self.total_calls += 1
+            return ToolResult(call.call_id, result, None, time.time() - start)
+        except Exception as e:
+            return ToolResult(call.call_id, None, str(e), time.time() - start)
+
+    def get_audit_log(self) -> List[dict]:
+        return [
+            {
+                "call_id": r.call_id,
+                "error": r.error,
+                "elapsed": r.elapsed,
+                "timestamp": datetime.now(TZ).isoformat()
+            }
+            for r in self.call_history
+        ]
+
+# Tool implementations
+def safe_calculator(expression: str) -> float:
+    """Safe calculator using AST with whitelist"""
+    allowed_ops = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.Pow: operator.pow,
+        ast.USub: operator.neg,
+    }
+    
+    def eval_node(node):
+        if isinstance(node, ast.Constant):
+            return node.value
+        elif isinstance(node, ast.BinOp):
+            left = eval_node(node.left)
+            right = eval_node(node.right)
+            op = allowed_ops.get(type(node.op))
+            if not op:
+                raise ValueError(f"Operator {type(node.op)} not allowed")
+            return op(left, right)
+        elif isinstance(node, ast.UnaryOp):
+            operand = eval_node(node.operand)
+            op = allowed_ops.get(type(node.op))
+            if not op:
+                raise ValueError(f"Unary operator {type(node.op)} not allowed")
+            return op(operand)
+        else:
+            raise ValueError(f"Expression element {type(node)} not allowed")
+    
+    try:
+        tree = ast.parse(expression, mode='eval')
+        result = eval_node(tree.body)
+        return float(result)
+    except Exception as e:
+        raise ValueError(f"Invalid expression: {e}")
+
+def sanitize_context(text: str) -> str:
+    """Remove potential prompt injection attempts"""
+    dangerous_patterns = [
+        r"(?i)ignore previous instructions",
+        r"(?i)system\s*:",
+        r"(?i)forget (all|previous)",
+        r"TOOL_CALL\s*:",
+        r"<\|.*?\|>",
+        r"\{\{.*?\}\}",
+    ]
+    
+    sanitized = text
+    for pattern in dangerous_patterns:
+        sanitized = re.sub(pattern, "[REDACTED]", sanitized, flags=re.IGNORECASE)
+    
+    return sanitized[:5000]  # Limit length
+
+class ToolCallParser:
+    @staticmethod
+    def parse(content: str) -> List[ToolCall]:
+        """Parse tool calls using bracket counting"""
+        calls = []
+        # X塔必修: 真正的 bracket counting parser
+        i = 0
+        while i < len(content):
+            tc_idx = content.find("TOOL_CALL:", i)
+            if tc_idx < 0:
+                break
+            # 找工具名稱
+            name_match = re.match(r"TOOL_CALL:\s*(\w+)\s*", content[tc_idx:])
+            if not name_match:
+                i = tc_idx + 1
+                continue
+            tool_name = name_match.group(1)
+            name_end = tc_idx + name_match.end()
+            # 找 JSON block 起始 {
+            brace = content.find("{", name_end)
+            if brace < 0:
+                i = name_end
+                continue
+            # bracket counting 解析完整 JSON
+            depth = 0
+            in_str = False
+            esc = False
+            j = brace
+            end = -1
+            while j < len(content):
+                c = content[j]
+                if esc:
+                    esc = False
+                elif c == "\\":
+                    esc = True
+                elif c == '"' and not esc:
+                    in_str = not in_str
+                elif not in_str:
+                    if c == "{":
+                        depth += 1
+                    elif c == "}":
+                        depth -= 1
+                        if depth == 0:
+                            end = j
+                            break
+                j += 1
+            if end < 0:
+                i = tc_idx + 1
+                continue
+            try:
+                params = json.loads(content[brace:end+1])
+                calls.append(ToolCall(
+                    name=tool_name,
+                    arguments=params,
+                    call_id=f"{tower}_{tool_name}_{int(time.time())}"
+                ))
+            except json.JSONDecodeError:
+                pass
+            i = end + 1
+        return calls
+
+# L2: WorkflowState class
+class WorkflowState:
+    def __init__(self, task_id: str, task: str, workflow: str):
+        self.task_id = task_id
+        self.task = task
+        self.workflow = workflow
+        self.outputs: List[TowerOutput] = []
+        self.current_input: str = task
+        self.merged: dict = {}
+        self._errors: List[str] = []
+        self.channel: Optional['TowerChannel'] = None
+
+    def add(self, output: TowerOutput) -> None:
+        self.outputs.append(output)
+        if output.status == "error":
+            self._errors.append(f"{output.tower}: {output.error_detail or output.content}")
+        else:
+            if output.next_input:
+                self.current_input = sanitize_context(output.next_input)
+            if output.structured:
+                self._merge_structured(output.structured)
+
+    def _merge_structured(self, structured: dict):
+        allowed_fields = ALLOWED_STRUCTURED_FIELDS_BY_WORKFLOW.get(self.workflow, set())
+        for key, value in structured.items():
+            if key in allowed_fields:
+                self.merged[key] = value
+            elif key == "tool_results" and isinstance(value, list):
+                self.merged.setdefault("tool_results", []).extend(value)
+
+    def finalize(self) -> WorkflowResult:
+        status = self._determine_status()
+        summary = self._generate_summary()
+        
+        return WorkflowResult(
+            task_id=self.task_id,
+            task=self.task,
+            workflow=self.workflow,
+            towers=[o.tower for o in self.outputs],
+            summary=summary,
+            structured=self.merged,
+            total_tokens=self.total_tokens(),
+            total_elapsed=self.total_elapsed(),
+            status=status,
+            timestamp=datetime.now(TZ).isoformat()
+        )
+
+    def get_structured(self, tower: str) -> dict:
+        for output in self.outputs:
+            if output.tower == tower:
+                return output.structured
+        return {}
+
+    def total_tokens(self) -> int:
+        return sum(o.tokens for o in self.outputs)
+
+    def total_elapsed(self) -> float:
+        return sum(o.elapsed for o in self.outputs)
+
+    def _determine_status(self) -> str:
+        if not self.outputs:
+            return "error"
+        if all(o.status == "ok" for o in self.outputs):
+            return "ok"
+        critical_towers = self._get_critical_towers()
+        if any(o.tower in critical_towers and o.status == "error" for o in self.outputs):
+            return "error"
+        return "partial"
+
+    def _get_critical_towers(self) -> set:
+        critical_map = {
+            "research": {"S"},
+            "decision": {"X"},
+            "create": {"X"},
+            "verify": {"X"}
+        }
+        return critical_map.get(self.workflow, set())
+
+    def _generate_summary(self) -> str:
+        if not self.outputs:
+            return "No outputs generated"
+        
+        ok_count = sum(1 for o in self.outputs if o.status == "ok")
+        error_count = len(self._errors)
+        
+        if error_count > 0:
+            return f"Workflow completed with {error_count} error(s). {ok_count} tower(s) succeeded."
+        return f"Workflow completed successfully. {ok_count} tower(s) processed."
+
+class TowerChannel:
+    def __init__(self, state: WorkflowState):
+        self.state = state
+        state.channel = self
+
+    def query(self, tower: str, field: str, default: Any = None) -> Any:
+        """Query a specific field（含白名單+ok狀態驗證）"""
+        workflow = self.state.workflow
+        allowed = ALLOWED_STRUCTURED_FIELDS_BY_WORKFLOW.get(workflow, set())
+        if allowed and field not in allowed:
+            return default
+        for out in self.state.outputs:
+            if out.tower == tower and out.status != "ok":
+                return default
+        return self.state.get_structured(tower).get(field, default)
+
+    def query_all(self, tower: str, ok_only: bool = True) -> dict:
+        """Query all structured data from a tower, optionally filtering error towers"""
+        if ok_only:
+            for output in self.state.outputs:
+                if output.tower == tower and output.status == "ok":
+                    return output.structured
+            return {}
+        return self.state.get_structured(tower)
+
+    def has_tower(self, tower: str, status_ok: bool = True) -> bool:
+        """Check if a tower exists with optional status filter"""
+        for output in self.state.outputs:
+            if output.tower == tower:
+                if status_ok:
+                    return output.status == "ok"
+                return True
+        return False
+
+def _build_context(state: WorkflowState, current_tower: str) -> str:
+    """Build context from previous towers with sanitization"""
+    context_parts = []
+    for output in state.outputs:
+        if output.status != "ok":
+            continue
+        
+        if output.tower == current_tower:
+            continue
+        
+        summary = output.content[:500] if len(output.content) > 500 else output.content
+        context_parts.append(f"[{output.tower}塔]: {summary}")
+    
+    return "\n".join(context_parts)
+
+# L3: call_tower_structured implementation
+def call_tower_structured(tower: str, system: str, history: list, msg: str, task_id: str, keys: dict, 
+                         timeout: int = 45, state: Optional[WorkflowState] = None, 
+                         registry: Optional[ToolRegistry] = None) -> TowerOutput:
+    start_time = time.time()
+    
+    try:
+        if tower == "F":
+            return _call_deepseek(system, history, msg, task_id, keys, timeout, start_time, state, registry)
+        elif tower == "T":
+            return _call_gemini(system, history, msg, task_id, keys, timeout, start_time, state, registry)
+        elif tower == "S":
+            return _call_anthropic(system, history, msg, task_id, keys, timeout, start_time, state, registry)
+        elif tower == "X":
+            return _call_openai(system, history, msg, task_id, keys, timeout, start_time, state, registry)
+        else:
+            return _error_output(task_id, tower, f"Unknown tower type: {tower}", start_time)
+    except Exception as e:
+        return _error_output(task_id, tower, f"Tower {tower} failed: {str(e)[:100]}", start_time, str(e))
+
+def _error_output(task_id: str, tower: str, content: str, start_time: float, error_detail: str = "") -> TowerOutput:
+    return TowerOutput(
+        task_id=task_id,
+        tower=tower,
+        status="error",
+        content=content,
+        error_detail=error_detail,
+        elapsed=time.time() - start_time
+    )
+
+def _call_deepseek(system: str, history: list, msg: str, task_id: str, keys: dict, timeout: int, 
+                   start_time: float, state: Optional[WorkflowState], registry: Optional[ToolRegistry]) -> TowerOutput:
+    api_key = keys.get("deepseek", "")
+    if not api_key:
+        return _error_output(task_id, "F", "DeepSeek API key not configured", start_time)
+    
+    messages = [{"role": "system", "content": system}]
+    for h in history:
+        messages.append({"role": h.get("role", "user"), "content": sanitize_context(h.get("content", ""))})
+    
+    context = _build_context(state, "F") if state else ""
+    full_msg = f"{context}\n\n{msg}" if context else msg
+    messages.append({"role": "user", "content": sanitize_context(full_msg)})
+    
+    try:
+        response = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": "deepseek-chat", "messages": messages, "temperature": 0.7},
+            timeout=timeout
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        content = data["choices"][0]["message"]["content"]
+        tokens = data.get("usage", {}).get("total_tokens", 0)
+        
+        tool_calls = []
+        tool_results = []
+        if registry:
+            tool_calls = ToolCallParser.parse(content)
+            for call in tool_calls[:MAX_TOOL_CALLS_PER_TOWER]:
+                result = registry.execute(call, "F", state.workflow if state else "unknown")
+                tool_results.append({
+                    "call_id": result.call_id,
+                    "result": str(result.result)[:MAX_TOOL_RESULT_CHARS],
+                    "error": result.error
+                })
+        
+        structured = _parse_structured_output(content)
+        if tool_results:
+            structured["tool_results"] = tool_results
+        
+        return TowerOutput(
+            task_id=task_id,
+            tower="F",
+            status="ok",
+            content=content,
+            structured=structured,
+            confidence=0.85,
+            tokens=tokens,
+            elapsed=time.time() - start_time,
+            tool_audit=registry.get_audit_log() if registry else []
+        )
+    except requests.exceptions.Timeout:
+        return _error_output(task_id, "F", f"Timeout after {timeout}s", start_time)
+    except requests.exceptions.RequestException as e:
+        return _error_output(task_id, "F", f"API request failed: {str(e)[:100]}", start_time, str(e))
+    except Exception as e:
+        return _error_output(task_id, "F", f"Unexpected error: {str(e)[:100]}", start_time, str(e))
+
+def _call_gemini(system: str, history: list, msg: str, task_id: str, keys: dict, timeout: int, 
+                 start_time: float, state: Optional[WorkflowState], registry: Optional[ToolRegistry]) -> TowerOutput:
+    api_key = keys.get("gemini", "")
+    if not api_key:
+        return _error_output(task_id, "T", "Gemini API key not configured", start_time)
+    
+    prompt = f"{system}\n\n"
+    for h in history:
+        prompt += f"{h.get('role', 'user')}: {sanitize_context(h.get('content', ''))}\n"
+    
+    context = _build_context(state, "T") if state else ""
+    full_msg = f"{context}\n\n{msg}" if context else msg
+    prompt += f"user: {sanitize_context(full_msg)}"
+    
+    try:
+        response = requests.post(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent",
+            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=timeout
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        content = data["candidates"][0]["content"]["parts"][0]["text"]
+        tokens = data.get("usageMetadata", {}).get("totalTokenCount", 0)
+        
+        tool_calls = []
+        tool_results = []
+        if registry:
+            tool_calls = ToolCallParser.parse(content)
+            for call in tool_calls[:MAX_TOOL_CALLS_PER_TOWER]:
+                result = registry.execute(call, "T", state.workflow if state else "unknown")
+                tool_results.append({
+                    "call_id": result.call_id,
+                    "result": str(result.result)[:MAX_TOOL_RESULT_CHARS],
+                    "error": result.error
+                })
+        
+        structured = _parse_structured_output(content)
+        if tool_results:
+            structured["tool_results"] = tool_results
+        
+        return TowerOutput(
+            task_id=task_id,
+            tower="T",
+            status="ok",
+            content=content,
+            structured=structured,
+            confidence=0.85,
+            tokens=tokens,
+            elapsed=time.time() - start_time,
+            tool_audit=registry.get_audit_log() if registry else []
+        )
+    except Exception as e:
+        return _error_output(task_id, "T", f"Gemini API error: {str(e)[:100]}", start_time, str(e))
+
+def _call_anthropic(system: str, history: list, msg: str, task_id: str, keys: dict, timeout: int, 
+                    start_time: float, state: Optional[WorkflowState], registry: Optional[ToolRegistry]) -> TowerOutput:
+    api_key = keys.get("anthropic", "")
+    if not api_key:
+        return _error_output(task_id, "S", "Anthropic API key not configured", start_time)
+    
+    messages = []
+    for h in history:
+        messages.append({"role": h.get("role", "user"), "content": sanitize_context(h.get("content", ""))})
+    
+    context = _build_context(state, "S") if state else ""
+    full_msg = f"{context}\n\n{msg}" if context else msg
+    messages.append({"role": "user", "content": sanitize_context(full_msg)})
+    
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "claude-3-5-sonnet-20241022",
+                "system": system,
+                "messages": messages,
+                "max_tokens": 4096,
+                "temperature": 0.7
+            },
+            timeout=timeout
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        content = data["content"][0]["text"]
+        tokens = data.get("usage", {}).get("input_tokens", 0) + data.get("usage", {}).get("output_tokens", 0)
+        
+        tool_calls = []
+        tool_results = []
+        if registry:
+            tool_calls = ToolCallParser.parse(content)
+            for call in tool_calls[:MAX_TOOL_CALLS_PER_TOWER]:
+                result = registry.execute(call, "S", state.workflow if state else "unknown")
+                tool_results.append({
+                    "call_id": result.call_id,
+                    "result": str(result.result)[:MAX_TOOL_RESULT_CHARS],
+                    "error": result.error
+                })
+        
+        structured = _parse_structured_output(content)
+        if tool_results:
+            structured["tool_results"] = tool_results
+        
+        return TowerOutput(
+            task_id=task_id,
+            tower="S",
+            status="ok",
+            content=content,
+            structured=structured,
+            confidence=0.9,
+            tokens=tokens,
+            elapsed=time.time() - start_time,
+            tool_audit=registry.get_audit_log() if registry else []
+        )
+    except Exception as e:
+        return _error_output(task_id, "S", f"Anthropic API error: {str(e)[:100]}", start_time, str(e))
+
+def _call_openai(system: str, history: list, msg: str, task_id: str, keys: dict, timeout: int, 
+                 start_time: float, state: Optional[WorkflowState], registry: Optional[ToolRegistry]) -> TowerOutput:
+    api_key = keys.get("openai", "")
+    if not api_key:
+        return _error_output(task_id, "X", "OpenAI API key not configured", start_time)
+    
+    messages = [{"role": "system", "content": system}]
+    for h in history:
+        messages.append({"role": h.get("role", "user"), "content": sanitize_context(h.get("content", ""))})
+    
+    context = _build_context(state, "X") if state else ""
+    full_msg = f"{context}\n\n{msg}" if context else msg
+    messages.append({"role": "user", "content": sanitize_context(full_msg)})
+    
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": "gpt-4o-mini", "messages": messages, "temperature": 0.7},
+            timeout=timeout
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        content = data["choices"][0]["message"]["content"]
+        tokens = data.get("usage", {}).get("total_tokens", 0)
+        
+        tool_calls = []
+        tool_results = []
+        if registry:
+            tool_calls = ToolCallParser.parse(content)
+            for call in tool_calls[:MAX_TOOL_CALLS_PER_TOWER]:
+                result = registry.execute(call, "X", state.workflow if state else "unknown")
+                tool_results.append({
+                    "call_id": result.call_id,
+                    "result": str(result.result)[:MAX_TOOL_RESULT_CHARS],
+                    "error": result.error
+                })
+        
+        structured = _parse_structured_output(content)
+        if tool_results:
+            structured["tool_results"] = tool_results
+        
+        return TowerOutput(
+            task_id=task_id,
+            tower="X",
+            status="ok",
+            content=content,
+            structured=structured,
+            confidence=0.85,
+            tokens=tokens,
+            elapsed=time.time() - start_time,
+            tool_audit=registry.get_audit_log() if registry else []
+        )
+    except Exception as e:
+        return _error_output(task_id, "X", f"OpenAI API error: {str(e)[:100]}", start_time, str(e))
+
+def _parse_structured_output(content: str) -> dict:
+    """Robust JSON parsing with multiple fallback strategies"""
+    if not content:
+        return {}
+    
+    # Strategy 1: Try to find JSON in code blocks
+    json_candidates = []
+    
+    # Look for JSON in markdown code blocks
+    code_block_pattern = r'```(?:json)?\s*([\s\S]*?)```'
+    for match in re.finditer(code_block_pattern, content):
+        json_candidates.append(match.group(1).strip())
+    
+    # Strategy 2: Look for balanced braces
+    brace_pattern = r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}'
+    for match in re.finditer(brace_pattern, content):
+        json_candidates.append(match.group(0).strip())
+    
+    # Try parsing each candidate
+    for candidate in json_candidates:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
+    
+    # Strategy 3: Try to extract key-value pairs
+    try:
+        result = {}
+        lines = content.split('\n')
+        for line in lines:
+            if ':' in line and not line.strip().startswith('#'):
+                key, value = line.split(':', 1)
+                key = key.strip().strip('"').strip("'")
+                value = value.strip().strip('"').strip("'")
+                if key and value:
+                    result[key] = value
+        if result:
+            return result
+    except Exception:
+        pass
+    
+    return {}
+
+# Example tool registration
+def setup_default_tools(registry: ToolRegistry):
+    registry.register(ToolDef(
+        name="calculator",
+        description="Perform safe mathematical calculations",
+        parameters={"expression": {"type": "string", "description": "Math expression to evaluate"}},
+        handler=safe_calculator,
+        allowed_towers=["F", "X"]
+    ))
+
 # ── 持久化儲存（Railway Volume）────────────────────────────────
 DATA_DIR   = os.environ.get("DATA_DIR", "/data")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
@@ -309,7 +1008,7 @@ LOG_FILE   = os.path.join(DATA_DIR, "route_log.jsonl")
 
 DEFAULT_STATE = {
     "version": "1.0",
-    "bot_version": "5.5",
+    "bot_version": "5.6",
     "session_count": 0,
     "last_task_id": None,
     "last_updated": None,
@@ -655,7 +1354,7 @@ def handle_msg(m):
             [{"text":"🤖智能路由","callback_data":"mode_AUTO"},{"text":"🗑清除","callback_data":"clear"}],
         ]}
         un = f"@{u.get('username')}" if u.get("username") else u.get("first_name","User")
-        send(cid, f"*XTFS Bot v5.5 智能路由版* 🚀\n\n"
+        send(cid, f"*XTFS Bot v5.6 智能路由版* 🚀\n\n"
                   f"歡迎 {un}！\n\n"
                   f"⚙️ F·DeepSeek — 邏輯/程式\n"
                   f"🌐 T·Gemini — 事實/即時\n"
@@ -780,7 +1479,7 @@ def handle_cb(q):
 # ── 主迴圈 ────────────────────────────────────────────────────
 def run():
     offset = 0
-    print(f"✅ XTFS Bot v5.5 啟動 | {datetime.now(TZ).strftime('%Y-%m-%d %H:%M')}")
+    print(f"✅ XTFS Bot v5.6 啟動 | {datetime.now(TZ).strftime('%Y-%m-%d %H:%M')}")
     while True:
         try:
             r = requests.get(f"{API}/getUpdates",
