@@ -14,10 +14,10 @@ Railway 長輪詢部署
 版本：v5.5.0
 """
 
-import json, os, time, requests, threading
+import json, os, time, requests, threading, re
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Callable, Tuple
 
 TZ = timezone(timedelta(hours=8))
 
