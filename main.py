@@ -16,6 +16,8 @@ Railway 長輪詢部署
 
 import json, os, time, requests, threading
 from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass, field
+from typing import List, Optional
 
 TZ = timezone(timedelta(hours=8))
 
