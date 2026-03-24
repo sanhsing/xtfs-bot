@@ -523,11 +523,20 @@ def call_tower(tower: str, system: str, history: list, msg: str, timeout=45) -> 
             return d["candidates"][0]["content"]["parts"][0]["text"],d.get("usageMetadata",{}).get("totalTokenCount",0)
 
         elif tower == "S":
-            msgs=history+[{"role":"user","content":msg}]
-            r=requests.post("https://api.anthropic.com/v1/messages",
-                headers={"x-api-key":KEYS["anthropic"],"anthropic-version":"2023-06-01","content-type":"application/json"},
-                json={"model":"claude-3-5-sonnet-20241022","max_tokens":1024,"system":system,"messages":msgs},timeout=timeout)
-            d=r.json(); return d["content"][0]["text"],d.get("usage",{}).get("input_tokens",0)+d.get("usage",{}).get("output_tokens",0)
+            try:
+                msgs=history+[{"role":"user","content":msg}]
+                r=requests.post("https://api.anthropic.com/v1/messages",
+                    headers={"x-api-key":KEYS["anthropic"],"anthropic-version":"2023-06-01","content-type":"application/json"},
+                    json={"model":"claude-3-5-sonnet-20241022","max_tokens":1024,"system":system,"messages":msgs},timeout=timeout)
+                d=r.json()
+                if "content" not in d: raise ValueError(d.get("error",{}).get("message","S塔無回應"))
+                return d["content"][0]["text"],d.get("usage",{}).get("input_tokens",0)+d.get("usage",{}).get("output_tokens",0)
+            except Exception:
+                # S塔失敗 → fallback F塔
+                r=requests.post("https://api.deepseek.com/chat/completions",
+                    headers={"Authorization":f"Bearer {KEYS['deepseek']}","Content-Type":"application/json"},
+                    json={"model":"deepseek-chat","messages":[{"role":"system","content":system}]+history+[{"role":"user","content":msg}],"max_tokens":1000},timeout=timeout)
+                d=r.json(); return "[S→F] "+d["choices"][0]["message"]["content"],d.get("usage",{}).get("total_tokens",0)
 
         elif tower == "X":
             r=requests.post("https://api.openai.com/v1/chat/completions",
