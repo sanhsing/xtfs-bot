@@ -1,5 +1,5 @@
 """
-XTFS Bot v5.3 — 智能路由版
+XTFS Bot v5.3 — 智能路由版 
 設計：@織明 | 2026-03-24
 """
 import json, os, time, requests, threading
