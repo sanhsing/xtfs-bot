@@ -1,0 +1,9 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/mine",
+      "schedule": "0 13 * * 2",
+      "description": "每週二 21:00 (UTC+8) 自動執行 GDrive Mining"
+    }
+  ]
+}
